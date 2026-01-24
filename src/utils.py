@@ -1,12 +1,8 @@
 """
-Utility functions V2
-
-Miglioramenti:
-    - Loss più robuste
-    - Smooth L1 option
-    - Logging migliorato
+Loss functions e utilities per training.
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,362 +12,254 @@ import json
 from datetime import datetime
 
 
-# ============================================================================
+# =============================================================================
 # LOSS FUNCTIONS
-# ============================================================================
+# =============================================================================
 
-def compute_mse_loss(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    pad_mask: Optional[torch.Tensor] = None,
-    smooth: bool = False,
-) -> torch.Tensor:
-    """
-    Calcola MSE (o Smooth L1) loss mascherando il padding.
+def mse_loss(pred: torch.Tensor, target: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """MSE con masking del padding."""
+    loss = (pred - target) ** 2
     
-    Args:
-        pred: (B, T, F)
-        target: (B, T, F)
-        pad_mask: (B, T), True dove c'è padding
-        smooth: Se True usa Smooth L1 invece di MSE
-    """
-    if smooth:
-        loss_per_elem = F.smooth_l1_loss(pred, target, reduction='none')
-    else:
-        loss_per_elem = (pred - target) ** 2
+    if mask is not None:
+        valid = ~mask.unsqueeze(-1)
+        loss = loss * valid.float()
+        n = valid.sum()
+        return loss.sum() / n.clamp(min=1)
     
-    if pad_mask is not None:
-        # Maschera: True dove NON c'è padding
-        mask = ~pad_mask.unsqueeze(-1)  # (B, T, 1)
-        loss_per_elem = loss_per_elem * mask.float()
-        
-        num_valid = mask.sum()
-        if num_valid > 0:
-            loss = loss_per_elem.sum() / num_valid
-        else:
-            loss = loss_per_elem.sum() * 0
-    else:
-        loss = loss_per_elem.mean()
-    
-    return loss
+    return loss.mean()
 
 
-def compute_endpoint_loss(
-    pred: torch.Tensor,
-    S: torch.Tensor,
-    lengths: torch.Tensor,
-) -> torch.Tensor:
-    """
-    MSE su primo e ultimo punto.
+def endpoint_loss(pred: torch.Tensor, S: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    """Loss su start e end point."""
+    B = pred.size(0)
     
-    Args:
-        pred: (B, T, F)
-        S: (B, 4) = [x_start, y_start, x_end, y_end]
-        lengths: (B,)
-    """
-    batch_size = pred.size(0)
-    
-    # Target
-    start_target = S[:, :2]  # (B, 2)
-    end_target = S[:, 2:]    # (B, 2)
-    
-    # Primo punto
-    start_pred = pred[:, 0, :2]  # (B, 2)
-    
-    # Ultimo punto (all'indice L-1)
-    end_indices = (lengths - 1).clamp(min=0).view(batch_size, 1, 1).expand(-1, 1, 2)
-    end_pred = torch.gather(pred[:, :, :2], dim=1, index=end_indices).squeeze(1)
-    
+    # Start
+    start_pred = pred[:, 0, :2]
+    start_target = S[:, :2]
     loss_start = ((start_pred - start_target) ** 2).mean()
+    
+    # End
+    end_idx = (lengths - 1).clamp(min=0).view(B, 1, 1).expand(-1, 1, 2)
+    end_pred = torch.gather(pred[:, :, :2], 1, end_idx).squeeze(1)
+    end_target = S[:, 2:]
     loss_end = ((end_pred - end_target) ** 2).mean()
     
     return loss_start + loss_end
 
 
-def compute_smoothness_loss(
+def smoothness_loss(pred: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Penalizza accelerazioni brusche (2nd derivative)."""
+    diff1 = pred[:, 1:, :] - pred[:, :-1, :]
+    diff2 = diff1[:, 1:, :] - diff1[:, :-1, :]
+    
+    if mask is not None:
+        valid = ~mask[:, 2:].unsqueeze(-1)
+        diff2 = diff2 * valid.float()
+        n = valid.sum()
+        return (diff2 ** 2).sum() / n.clamp(min=1)
+    
+    return (diff2 ** 2).mean()
+
+
+def diversity_loss(modes: torch.Tensor, probs: torch.Tensor, min_dist: float = 1.0) -> torch.Tensor:
+    """Incoraggia diversità tra modi."""
+    B, K, T, Feat = modes.shape
+    
+    if K < 2:
+        return torch.tensor(0.0, device=modes.device)
+    
+    loss = 0.0
+    count = 0
+    
+    for i in range(K):
+        for j in range(i + 1, K):
+            dist = ((modes[:, i] - modes[:, j]) ** 2).mean(dim=(1, 2))
+            penalty = F.relu(min_dist - dist)
+            weight = torch.sqrt(probs[:, i] * probs[:, j])
+            loss += (penalty * weight).mean()
+            count += 1
+    
+    return loss / max(count, 1)
+
+
+def collision_loss(
     pred: torch.Tensor,
-    pad_mask: Optional[torch.Tensor] = None,
+    C: torch.Tensor,
+    ctx_mask: torch.Tensor,
+    threshold: float = 2.0,
 ) -> torch.Tensor:
-    """
-    Penalizza cambiamenti bruschi nella traiettoria.
-    Calcola la varianza delle differenze consecutive.
-    """
-    # Differenze consecutive
-    diff = pred[:, 1:, :] - pred[:, :-1, :]  # (B, T-1, F)
+    """Penalizza vicinanza ad altri veicoli."""
+    pred_pos = pred[:, :, :2].unsqueeze(2)  # (B, T, 1, 2)
+    ctx_pos = C[:, :, :2].unsqueeze(1)       # (B, 1, N, 2)
     
-    # Seconda derivata (accelerazione)
-    diff2 = diff[:, 1:, :] - diff[:, :-1, :]  # (B, T-2, F)
+    dist = torch.sqrt(((pred_pos - ctx_pos) ** 2).sum(dim=-1) + 1e-8)  # (B, T, N)
     
-    if pad_mask is not None:
-        # Maschera per le differenze (shift di 2)
-        mask = ~pad_mask[:, 2:]  # (B, T-2)
-        mask = mask.unsqueeze(-1)  # (B, T-2, 1)
-        
-        diff2_masked = diff2 * mask.float()
-        num_valid = mask.sum()
-        
-        if num_valid > 0:
-            loss = (diff2_masked ** 2).sum() / num_valid
-        else:
-            loss = (diff2 ** 2).mean() * 0
+    valid = ~ctx_mask.unsqueeze(1)  # (B, 1, N)
+    penalty = F.relu(threshold - dist) * valid.float()
+    
+    n = valid.sum(dim=2, keepdim=True).clamp(min=1)
+    return (penalty.sum(dim=2) / n.squeeze(-1)).mean()
+
+
+def winner_takes_all_loss(
+    modes: torch.Tensor,
+    target: torch.Tensor,
+    probs: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """WTA: allena solo il modo più vicino al target."""
+    B, K, T, Feat = modes.shape
+    
+    target_exp = target.unsqueeze(1).expand(-1, K, -1, -1)
+    errors = (modes - target_exp) ** 2
+    
+    if mask is not None:
+        valid = ~mask.unsqueeze(1).unsqueeze(-1)
+        errors = errors * valid.float()
+        n = valid.sum(dim=(2, 3)).clamp(min=1)
+        mode_errors = errors.sum(dim=(2, 3)) / n
     else:
-        loss = (diff2 ** 2).mean()
+        mode_errors = errors.mean(dim=(2, 3))
     
-    return loss
+    best_idx = mode_errors.argmin(dim=1)
+    best_errors = mode_errors[torch.arange(B), best_idx]
+    
+    return best_errors.mean(), best_idx
 
 
-def compute_total_loss(
+def total_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
     S: torch.Tensor,
     lengths: torch.Tensor,
     pad_mask: torch.Tensor,
-    weight_endpoint: float = 2.0,
-    weight_smoothness: float = 0.1,
+    C: Optional[torch.Tensor] = None,
+    ctx_mask: Optional[torch.Tensor] = None,
+    modes: Optional[torch.Tensor] = None,
+    probs: Optional[torch.Tensor] = None,
+    w_endpoint: float = 3.0,
+    w_smooth: float = 0.05,
+    w_diverse: float = 0.1,
+    w_collision: float = 0.5,
+    use_wta: bool = True,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """
-    Loss totale con tutti i termini.
-    """
-    # MSE principale
-    mse_loss = compute_mse_loss(pred, target, pad_mask)
+    """Compute total loss."""
     
-    # Endpoint loss
-    endpoint_loss = compute_endpoint_loss(pred, S, lengths)
+    losses = {}
     
-    # Smoothness loss (opzionale)
-    smoothness_loss = compute_smoothness_loss(pred, pad_mask)
+    # MSE or WTA
+    if use_wta and modes is not None and probs is not None:
+        main_loss, _ = winner_takes_all_loss(modes, target, probs, pad_mask)
+        losses['wta'] = main_loss.item()
+    else:
+        main_loss = mse_loss(pred, target, pad_mask)
+        losses['mse'] = main_loss.item()
     
-    # Totale
-    total_loss = mse_loss + weight_endpoint * endpoint_loss + weight_smoothness * smoothness_loss
+    # Endpoint
+    ep_loss = endpoint_loss(pred, S, lengths)
+    losses['endpoint'] = ep_loss.item()
     
-    loss_dict = {
-        'mse': mse_loss.item(),
-        'endpoint': endpoint_loss.item(),
-        'smoothness': smoothness_loss.item(),
-        'total': total_loss.item(),
-    }
+    # Smoothness
+    sm_loss = smoothness_loss(pred, pad_mask)
+    losses['smooth'] = sm_loss.item()
     
-    return total_loss, loss_dict
+    total = main_loss + w_endpoint * ep_loss + w_smooth * sm_loss
+    
+    # Diversity
+    if modes is not None and probs is not None and w_diverse > 0:
+        div_loss = diversity_loss(modes, probs)
+        total = total + w_diverse * div_loss
+        losses['diverse'] = div_loss.item()
+    
+    # Collision
+    if C is not None and ctx_mask is not None and w_collision > 0:
+        col_loss = collision_loss(pred, C, ctx_mask)
+        total = total + w_collision * col_loss
+        losses['collision'] = col_loss.item()
+    
+    losses['total'] = total.item()
+    
+    return total, losses
 
 
-# ============================================================================
-# CHECKPOINT MANAGEMENT
-# ============================================================================
+# =============================================================================
+# CHECKPOINT
+# =============================================================================
 
 def save_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
-    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
+    scheduler,
     epoch: int,
     loss: float,
-    checkpoint_dir: Path,
-    config_dict: Optional[Dict] = None,
+    path: Path,
     is_best: bool = False,
 ):
-    """Salva checkpoint."""
-    checkpoint_dir = Path(checkpoint_dir)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     
-    checkpoint = {
+    ckpt = {
         'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
+        'model': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'scheduler': scheduler.state_dict() if scheduler else None,
         'loss': loss,
-        'timestamp': datetime.now().isoformat(),
     }
     
-    if scheduler is not None:
-        checkpoint['scheduler_state_dict'] = scheduler.state_dict()
+    torch.save(ckpt, path / f"ckpt_epoch_{epoch:04d}.pt")
+    torch.save(ckpt, path / "ckpt_latest.pt")
     
-    if config_dict:
-        checkpoint['config'] = config_dict
-    
-    # Salva con numero epoca
-    path = checkpoint_dir / f"checkpoint_epoch_{epoch:04d}.pt"
-    torch.save(checkpoint, path)
-    
-    # Salva sempre l'ultimo
-    latest_path = checkpoint_dir / "checkpoint_latest.pt"
-    torch.save(checkpoint, latest_path)
-    
-    # Se è il migliore
     if is_best:
-        best_path = checkpoint_dir / "checkpoint_best.pt"
-        torch.save(checkpoint, best_path)
-        print(f"  ★ Nuovo best model! Loss: {loss:.6f}")
-    
-    return path
+        torch.save(ckpt, path / "ckpt_best.pt")
+        print(f"  ★ New best model! Loss: {loss:.6f}")
 
 
-def load_checkpoint(
-    checkpoint_path: Path,
-    model: nn.Module,
-    optimizer: Optional[torch.optim.Optimizer] = None,
-    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
-    device: str = "cuda",
-) -> Tuple[int, float]:
-    """Carica checkpoint."""
-    checkpoint_path = Path(checkpoint_path)
+def load_checkpoint(path: Path, model: nn.Module, optimizer=None, scheduler=None, device="cuda"):
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt['model'])
     
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint non trovato: {checkpoint_path}")
+    if optimizer and 'optimizer' in ckpt:
+        optimizer.load_state_dict(ckpt['optimizer'])
+    if scheduler and ckpt.get('scheduler'):
+        scheduler.load_state_dict(ckpt['scheduler'])
     
-    print(f"Caricando checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    
-    model.load_state_dict(checkpoint['model_state_dict'])
-    
-    if optimizer is not None and 'optimizer_state_dict' in checkpoint:
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    
-    if scheduler is not None and 'scheduler_state_dict' in checkpoint:
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-    
-    epoch = checkpoint.get('epoch', 0)
-    loss = checkpoint.get('loss', float('inf'))
-    
-    print(f"Checkpoint caricato: epoch={epoch}, loss={loss:.6f}")
-    
-    return epoch, loss
+    return ckpt['epoch'], ckpt['loss']
 
 
-def find_latest_checkpoint(checkpoint_dir: Path) -> Optional[Path]:
-    """Trova l'ultimo checkpoint."""
-    checkpoint_dir = Path(checkpoint_dir)
-    
-    latest = checkpoint_dir / "checkpoint_latest.pt"
-    if latest.exists():
-        return latest
-    
-    checkpoints = list(checkpoint_dir.glob("checkpoint_epoch_*.pt"))
-    if checkpoints:
-        return max(checkpoints, key=lambda p: int(p.stem.split('_')[-1]))
-    
-    return None
+# =============================================================================
+# SCHEDULER
+# =============================================================================
 
-
-# ============================================================================
-# LOGGING
-# ============================================================================
-
-class TrainingLogger:
-    """Logger con tracking di train e validation."""
-    
-    def __init__(self, log_dir: Path, filename: str = "training_log.json"):
-        self.log_dir = Path(log_dir)
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.log_file = self.log_dir / filename
-        
-        self.history = {
-            'epochs': [],
-            'train_loss': [],
-            'train_mse': [],
-            'train_endpoint': [],
-            'val_loss': [],
-            'val_mse': [],
-            'val_endpoint': [],
-            'learning_rate': [],
-        }
-        
-        if self.log_file.exists():
-            with open(self.log_file, 'r') as f:
-                self.history = json.load(f)
-    
-    def log(self, epoch: int, train_dict: Dict, val_dict: Optional[Dict], lr: float):
-        self.history['epochs'].append(epoch)
-        self.history['train_loss'].append(train_dict.get('total', 0))
-        self.history['train_mse'].append(train_dict.get('mse', 0))
-        self.history['train_endpoint'].append(train_dict.get('endpoint', 0))
-        self.history['learning_rate'].append(lr)
-        
-        if val_dict:
-            self.history['val_loss'].append(val_dict.get('total', 0))
-            self.history['val_mse'].append(val_dict.get('mse', 0))
-            self.history['val_endpoint'].append(val_dict.get('endpoint', 0))
-        
-        with open(self.log_file, 'w') as f:
-            json.dump(self.history, f, indent=2)
-    
-    def get_best_epoch(self) -> Tuple[int, float]:
-        if not self.history['val_loss']:
-            if not self.history['train_loss']:
-                return 0, float('inf')
-            best_idx = min(range(len(self.history['train_loss'])), 
-                          key=lambda i: self.history['train_loss'][i])
-            return self.history['epochs'][best_idx], self.history['train_loss'][best_idx]
-        
-        best_idx = min(range(len(self.history['val_loss'])), 
-                      key=lambda i: self.history['val_loss'][i])
-        return self.history['epochs'][best_idx], self.history['val_loss'][best_idx]
-
-
-def print_epoch_summary(
-    epoch: int, 
-    num_epochs: int, 
-    train_dict: Dict, 
-    val_dict: Optional[Dict],
-    lr: float
-):
-    """Stampa summary dell'epoca."""
-    train_str = f"Train: {train_dict['total']:.4f} (mse:{train_dict['mse']:.4f}, ep:{train_dict['endpoint']:.4f})"
-    
-    if val_dict:
-        val_str = f"Val: {val_dict['total']:.4f}"
-        print(f"Epoch [{epoch:3d}/{num_epochs}] | {train_str} | {val_str} | LR: {lr:.2e}")
-    else:
-        print(f"Epoch [{epoch:3d}/{num_epochs}] | {train_str} | LR: {lr:.2e}")
-
-
-# ============================================================================
-# LEARNING RATE SCHEDULERS
-# ============================================================================
-
-def get_cosine_schedule_with_warmup(
-    optimizer: torch.optim.Optimizer,
-    num_warmup_steps: int,
-    num_training_steps: int,
-    min_lr_ratio: float = 0.01,
-):
-    """
-    Cosine schedule con linear warmup.
-    """
-    def lr_lambda(current_step: int):
-        if current_step < num_warmup_steps:
-            return float(current_step) / float(max(1, num_warmup_steps))
-        
-        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
-        return max(min_lr_ratio, 0.5 * (1.0 + math.cos(math.pi * progress)))
+def get_cosine_schedule(optimizer, warmup_steps: int, total_steps: int, min_lr: float = 0.01):
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return max(min_lr, 0.5 * (1 + math.cos(math.pi * progress)))
     
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-import math
+# =============================================================================
+# LOGGING
+# =============================================================================
+
+class Logger:
+    def __init__(self, path: Path):
+        self.path = Path(path) / "log.json"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.history = {'train': [], 'val': [], 'lr': []}
+    
+    def log(self, epoch: int, train: Dict, val: Dict, lr: float):
+        self.history['train'].append({'epoch': epoch, **train})
+        self.history['val'].append({'epoch': epoch, **val})
+        self.history['lr'].append(lr)
+        
+        with open(self.path, 'w') as f:
+            json.dump(self.history, f, indent=2)
 
 
-if __name__ == "__main__":
-    print("=== Test Utils V2 ===\n")
-    
-    B, T, F = 4, 120, 4
-    pred = torch.randn(B, T, F)
-    target = torch.randn(B, T, F)
-    S = torch.randn(B, 4)
-    lengths = torch.randint(40, 120, (B,))
-    pad_mask = torch.zeros(B, T, dtype=torch.bool)
-    for i, L in enumerate(lengths):
-        pad_mask[i, L:] = True
-    
-    # Test losses
-    mse = compute_mse_loss(pred, target, pad_mask)
-    print(f"MSE Loss: {mse.item():.6f}")
-    
-    endpoint = compute_endpoint_loss(pred, S, lengths)
-    print(f"Endpoint Loss: {endpoint.item():.6f}")
-    
-    smoothness = compute_smoothness_loss(pred, pad_mask)
-    print(f"Smoothness Loss: {smoothness.item():.6f}")
-    
-    total, loss_dict = compute_total_loss(pred, target, S, lengths, pad_mask)
-    print(f"Total Loss: {total.item():.6f}")
-    print(f"Loss dict: {loss_dict}")
-    
-    print("\n✓ Test completato!")
+def print_epoch(epoch: int, n_epochs: int, train: Dict, val: Dict, lr: float, time: float):
+    train_str = f"loss={train['total']:.4f}"
+    val_str = f"loss={val['total']:.4f}"
+    print(f"Epoch [{epoch:3d}/{n_epochs}] | Train: {train_str} | Val: {val_str} | LR: {lr:.2e} | {time:.1f}s")
