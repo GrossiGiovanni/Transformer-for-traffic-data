@@ -62,7 +62,7 @@ class TrajectoryDataset(Dataset):
         
         # Condizioni
         cond_path = self._find_file(
-            ['S_train.npy', 'S_train_fixed.npy', 'conditions.npy', 'S.npy'],
+            ['S_train_fixed.npy', 'conditions.npy', 'S.npy'],
             'conditions'
         )
         self.conditions = np.load(cond_path)

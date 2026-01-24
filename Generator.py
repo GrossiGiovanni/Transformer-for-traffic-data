@@ -198,56 +198,164 @@ def compute_metrics(
     fake_trajectories: np.ndarray,
     conditions: np.ndarray,
     lengths: np.ndarray,
+    speed_idx: int = 2,   # feature index for speed
 ) -> dict:
     """Metriche escludendo padding."""
     metrics = {}
-    
-    # MSE solo su punti validi
+
+    # -------------------------
+    # Pointwise MSE (attenzione: utile solo se vuoi ricostruzione, non qualità generativa)
+    # -------------------------
     mse_list = []
     for i in range(len(real_trajectories)):
         L = int(lengths[i])
         mse = np.mean((real_trajectories[i, :L] - fake_trajectories[i, :L]) ** 2)
         mse_list.append(mse)
-    metrics['mse'] = float(np.mean(mse_list))
-    metrics['mse_std'] = float(np.std(mse_list))
-    
-    # Endpoint errors
-    start_errors = []
-    end_errors = []
+    metrics["mse"] = float(np.mean(mse_list))
+    metrics["mse_std"] = float(np.std(mse_list))
+
+    # -------------------------
+    # Endpoint errors (rispetto ai target condizionati)
+    # -------------------------
+    start_errors, end_errors = [], []
     for i in range(len(real_trajectories)):
         L = int(lengths[i])
-        
-        # Start
+
         start_pred = fake_trajectories[i, 0, :2]
         start_target = conditions[i, :2]
-        start_errors.append(np.sqrt(np.sum((start_pred - start_target) ** 2)))
-        
-        # End
-        end_pred = fake_trajectories[i, L-1, :2]
+        start_errors.append(np.linalg.norm(start_pred - start_target))
+
+        end_pred = fake_trajectories[i, L - 1, :2]
         end_target = conditions[i, 2:]
-        end_errors.append(np.sqrt(np.sum((end_pred - end_target) ** 2)))
-    
-    metrics['start_error'] = float(np.mean(start_errors))
-    metrics['end_error'] = float(np.mean(end_errors))
-    
-    # Feature statistics comparison
+        end_errors.append(np.linalg.norm(end_pred - end_target))
+
+    metrics["start_error"] = float(np.mean(start_errors))
+    metrics["end_error"] = float(np.mean(end_errors))
+
+    # -------------------------
+    # Feature statistics (global, padding escluso)
+    # -------------------------
     real_values = []
     fake_values = []
     for i in range(len(real_trajectories)):
         L = int(lengths[i])
         real_values.append(real_trajectories[i, :L])
         fake_values.append(fake_trajectories[i, :L])
-    
+
     real_values = np.concatenate(real_values, axis=0)
     fake_values = np.concatenate(fake_values, axis=0)
-    
-    for j, name in enumerate(['x', 'y', 'speed', 'angle']):
-        metrics[f'{name}_mean_real'] = float(real_values[:, j].mean())
-        metrics[f'{name}_mean_fake'] = float(fake_values[:, j].mean())
-        metrics[f'{name}_std_real'] = float(real_values[:, j].std())
-        metrics[f'{name}_std_fake'] = float(fake_values[:, j].std())
-    
+
+    for j, name in enumerate(["x", "y", "speed", "angle"]):
+        metrics[f"{name}_mean_real"] = float(real_values[:, j].mean())
+        metrics[f"{name}_mean_fake"] = float(fake_values[:, j].mean())
+        metrics[f"{name}_std_real"] = float(real_values[:, j].std())
+        metrics[f"{name}_std_fake"] = float(fake_values[:, j].std())
+
+    # -------------------------
+    # SPEED METRICS (padding escluso)
+    # -------------------------
+    def collect_valid_feat(arr, idx):
+        chunks = []
+        for i in range(len(arr)):
+            L = int(lengths[i])
+            chunks.append(arr[i, :L, idx])
+        return np.concatenate(chunks, axis=0)
+
+    real_speed = collect_valid_feat(real_trajectories, speed_idx)
+    fake_speed = collect_valid_feat(fake_trajectories, speed_idx)
+
+    # Clip opzionale per evitare valori negativi (dipende dal tuo preprocessing)
+    # real_speed = np.clip(real_speed, 0, None)
+    # fake_speed = np.clip(fake_speed, 0, None)
+
+    metrics["speed_mean_real"] = float(real_speed.mean())
+    metrics["speed_mean_fake"] = float(fake_speed.mean())
+    metrics["speed_std_real"]  = float(real_speed.std())
+    metrics["speed_std_fake"]  = float(fake_speed.std())
+    metrics["speed_max_real"]  = float(real_speed.max())
+    metrics["speed_max_fake"]  = float(fake_speed.max())
+    metrics["speed_p95_real"]  = float(np.percentile(real_speed, 95))
+    metrics["speed_p95_fake"]  = float(np.percentile(fake_speed, 95))
+
+    # Per-traj dynamics: acceleration e jerk (sulla feature speed)
+    # dt=1 (se hai dt reale diverso, dimmelo e lo mettiamo)
+    acc_real_all, acc_fake_all = [], []
+    jerk_real_all, jerk_fake_all = [], []
+
+    for i in range(len(real_trajectories)):
+        L = int(lengths[i])
+        if L < 3:
+            continue
+
+        sr = real_trajectories[i, :L, speed_idx]
+        sf = fake_trajectories[i, :L, speed_idx]
+
+        ar = np.diff(sr)         # acceleration
+        af = np.diff(sf)
+
+        jr = np.diff(ar)         # jerk
+        jf = np.diff(af)
+
+        acc_real_all.append(ar)
+        acc_fake_all.append(af)
+        jerk_real_all.append(jr)
+        jerk_fake_all.append(jf)
+
+    if acc_real_all:
+        acc_real = np.concatenate(acc_real_all)
+        acc_fake = np.concatenate(acc_fake_all)
+        metrics["acc_mean_abs_real"] = float(np.mean(np.abs(acc_real)))
+        metrics["acc_mean_abs_fake"] = float(np.mean(np.abs(acc_fake)))
+        metrics["acc_p95_abs_real"]  = float(np.percentile(np.abs(acc_real), 95))
+        metrics["acc_p95_abs_fake"]  = float(np.percentile(np.abs(acc_fake), 95))
+
+    if jerk_real_all:
+        jerk_real = np.concatenate(jerk_real_all)
+        jerk_fake = np.concatenate(jerk_fake_all)
+        metrics["jerk_mean_abs_real"] = float(np.mean(np.abs(jerk_real)))
+        metrics["jerk_mean_abs_fake"] = float(np.mean(np.abs(jerk_fake)))
+        metrics["jerk_p95_abs_real"]  = float(np.percentile(np.abs(jerk_real), 95))
+        metrics["jerk_p95_abs_fake"]  = float(np.percentile(np.abs(jerk_fake), 95))
+
     return metrics
+
+def plot_generated_trajectories(
+    fake_trajectories: np.ndarray,
+    conditions: np.ndarray,
+    lengths: np.ndarray,
+    num_trajs: int = 20,
+    save_path: Optional[Path] = None,
+    title: str = "Generated trajectories (sample)",
+):
+    n = min(num_trajs, len(fake_trajectories))
+    idx = np.random.choice(len(fake_trajectories), n, replace=False)
+
+    plt.figure(figsize=(8, 8))
+
+    for k, i in enumerate(idx):
+        L = int(lengths[i])
+        x = fake_trajectories[i, :L, 0]
+        y = fake_trajectories[i, :L, 1]
+
+        # line
+        plt.plot(x, y, linewidth=1.5, alpha=0.6)
+
+        # markers start/end target
+        plt.scatter([conditions[i, 0]], [conditions[i, 1]], s=30, marker='o', alpha=0.9)
+        plt.scatter([conditions[i, 2]], [conditions[i, 3]], s=35, marker='X', alpha=0.9)
+
+    plt.title(title, fontweight="bold")
+    plt.xlabel("X")
+    plt.ylabel("Y")
+    plt.grid(True, alpha=0.3)
+    plt.axis("equal")
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Plot salvato: {save_path}")
+
+    plt.show()
 
 
 def main(args):
@@ -318,11 +426,30 @@ def main(args):
         lengths=lengths,
         save_path=config.output_dir / "feature_distributions_v2.png",
     )
-    
+    plot_generated_trajectories(
+        fake_trajectories=fake_trajectories,
+        conditions=conditions,
+        lengths=lengths,
+        num_trajs=20,
+        save_path=config.output_dir / "generated_trajectories_20.png",
+    )
+
+    print(f"Speed mean:    {metrics['speed_mean_fake']:.6f} (real {metrics['speed_mean_real']:.6f})")
+    print(f"Speed p95:     {metrics['speed_p95_fake']:.6f} (real {metrics['speed_p95_real']:.6f})")
+    print(f"Speed max:     {metrics['speed_max_fake']:.6f} (real {metrics['speed_max_real']:.6f})")
+
+    if 'acc_mean_abs_fake' in metrics:
+        print(f"Acc |mean|:    {metrics['acc_mean_abs_fake']:.6f} (real {metrics['acc_mean_abs_real']:.6f})")
+        print(f"Acc |p95|:     {metrics['acc_p95_abs_fake']:.6f} (real {metrics['acc_p95_abs_real']:.6f})")
+
+    if 'jerk_mean_abs_fake' in metrics:
+        print(f"Jerk |mean|:   {metrics['jerk_mean_abs_fake']:.6f} (real {metrics['jerk_mean_abs_real']:.6f})")
+        print(f"Jerk |p95|:    {metrics['jerk_p95_abs_fake']:.6f} (real {metrics['jerk_p95_abs_real']:.6f})")
+
+
     print("\n" + "=" * 70)
     print("GENERAZIONE COMPLETATA!")
     print("=" * 70)
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
