@@ -65,13 +65,14 @@ def train_epoch(model, loader, optimizer, scheduler, config, device):
     return {k: v / n for k, v in accum.items()}
 
 
+
 @torch.no_grad()
 def validate(model, loader, config, device):
     model.eval()
-    
+
     accum = {'total': 0, 'mse': 0, 'endpoint': 0}
     n = 0
-    
+
     for batch in loader:
         X = batch['X'].to(device)
         S = batch['S'].to(device)
@@ -79,24 +80,29 @@ def validate(model, loader, config, device):
         L = batch['L'].to(device)
         pad_mask = batch['pad_mask'].to(device)
         ctx_mask = batch['ctx_mask'].to(device)
-        
+
         z = torch.randn(X.size(0), config.latent_dim, device=device)
-        
-        pred = model(z, S, C, ctx_mask)
-        
+
+        # ✅ same as training
+        modes, probs, pred = model.forward_multimodal(z, S, C, ctx_mask)
+
         _, losses = total_loss(
             pred=pred, target=X, S=S, lengths=L,
             pad_mask=pad_mask, C=C, ctx_mask=ctx_mask,
+            modes=modes, probs=probs,
             w_endpoint=config.weight_endpoint,
             w_smooth=config.weight_smoothness,
-            use_wta=False,
+            w_diverse=config.weight_diversity,
+            w_collision=config.weight_collision,
+            # use_wta=True (default)
         )
-        
+
         for k, v in losses.items():
             accum[k] = accum.get(k, 0) + v
         n += 1
-    
+
     return {k: v / n for k, v in accum.items()}
+
 
 
 def main(args):

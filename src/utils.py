@@ -61,8 +61,13 @@ def smoothness_loss(pred: torch.Tensor, mask: Optional[torch.Tensor] = None) -> 
     return (diff2 ** 2).mean()
 
 
-def diversity_loss(modes: torch.Tensor, probs: torch.Tensor, min_dist: float = 1.0) -> torch.Tensor:
-    """Incoraggia diversità tra modi."""
+def diversity_loss(modes: torch.Tensor, probs: torch.Tensor, min_dist: float = 0.05) -> torch.Tensor:
+    """
+    Incoraggia diversità tra modi.
+    
+    Per dati normalizzati [0,1], min_dist=0.05 significa che i modi
+    devono differire di almeno il 5% dello spazio.
+    """
     B, K, T, Feat = modes.shape
     
     if K < 2:
@@ -73,10 +78,14 @@ def diversity_loss(modes: torch.Tensor, probs: torch.Tensor, min_dist: float = 1
     
     for i in range(K):
         for j in range(i + 1, K):
+            # Distanza media tra modo i e j
             dist = ((modes[:, i] - modes[:, j]) ** 2).mean(dim=(1, 2))
+            
+            # Penalizza se troppo simili
             penalty = F.relu(min_dist - dist)
-            weight = torch.sqrt(probs[:, i] * probs[:, j])
-            loss += (penalty * weight).mean()
+            
+            # Peso uniforme (non basato su probs per evitare mode collapse)
+            loss += penalty.mean()
             count += 1
     
     return loss / max(count, 1)
@@ -86,7 +95,7 @@ def collision_loss(
     pred: torch.Tensor,
     C: torch.Tensor,
     ctx_mask: torch.Tensor,
-    threshold: float = 2.0,
+    threshold: float = 0.05,  # 5% dello spazio per dati [0,1]
 ) -> torch.Tensor:
     """Penalizza vicinanza ad altri veicoli."""
     pred_pos = pred[:, :, :2].unsqueeze(2)  # (B, T, 1, 2)

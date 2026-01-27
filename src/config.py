@@ -43,17 +43,18 @@ class Config:
     num_modes: int = 3                 # K: modi multimodali
     
     # ============== Training ==============
-    batch_size: int = 32
-    gradient_accumulation_steps: int = 4
-    learning_rate: float = 1e-4
-    num_epochs: int = 10
+    batch_size: int = 256              # Aumentato da 32 (RTX 4080 ha 16GB)
+    gradient_accumulation_steps: int = 2  # Effective batch = 256
+    learning_rate: float = 2e-4        # Aumentato per batch più grande
+    num_epochs: int = 200
     warmup_epochs: int = 10
     
     # ============== Loss Weights ==============
-    weight_endpoint: float = 3.0       # Start/end accuracy
-    weight_smoothness: float = 0.05    # Penalizza accelerazioni brusche
-    weight_diversity: float = 0.1      # Diversità tra modi
-    weight_collision: float = 0.5      # Evita collisioni col contesto
+    # Ottimizzati per dati normalizzati [0,1]
+    weight_endpoint: float = 10.0      # Start/end accuracy (aumentato)
+    weight_smoothness: float = 1.0     # Penalizza accelerazioni brusche (aumentato)
+    weight_diversity: float = 0.5      # Diversità tra modi (aumentato per evitare mode collapse)
+    weight_collision: float = 0.1      # Evita collisioni (ridotto - era troppo dominante)
     
     # ============== Regularization ==============
     weight_decay: float = 0.01

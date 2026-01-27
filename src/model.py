@@ -266,14 +266,21 @@ class RecedingHorizonDecoder(nn.Module):
         self.transformer = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
         
         # Multi-modal output heads
+        # Output: delta rispetto a posizione corrente, in [0, 1]
         self.traj_heads = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(d_model, d_model // 2),
                 nn.GELU(),
                 nn.Linear(d_model // 2, num_features),
+                nn.Sigmoid(),  # Output in [0, 1]
             )
             for _ in range(num_modes)
         ])
+        
+        # Scale factor per i delta: Sigmoid dà [0,1], 
+        # moltiplichiamo per 0.6 e sottraiamo 0.3 per avere [-0.3, 0.3]
+        self.delta_scale = 0.6
+        self.delta_shift = 0.3
         
         # Mode probability predictor
         self.mode_head = nn.Sequential(
@@ -290,6 +297,7 @@ class RecedingHorizonDecoder(nn.Module):
         z: torch.Tensor,                # (B, d_model)
         current_state: Optional[torch.Tensor] = None,  # (B, num_features)
         time_offset: int = 0,
+        start_pos: Optional[torch.Tensor] = None,  # (B, 2) posizione iniziale
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Genera una finestra di L step.
@@ -299,6 +307,7 @@ class RecedingHorizonDecoder(nn.Module):
             mode_probs: (B, K)
         """
         B = context.size(0)
+        device = context.device
         
         # Build memory for cross-attention
         memory = [
@@ -319,8 +328,40 @@ class RecedingHorizonDecoder(nn.Module):
         # Decode
         output = self.transformer(tgt=queries, memory=memory)
         
-        # Multi-modal trajectories
-        traj_modes = torch.stack([head(output) for head in self.traj_heads], dim=1)
+        # Multi-modal trajectories: Sigmoid [0,1] -> scale & shift to [-0.3, 0.3]
+        traj_deltas = torch.stack([head(output) for head in self.traj_heads], dim=1)
+        traj_deltas = traj_deltas * self.delta_scale - self.delta_shift  # [0,1]*0.6 - 0.3 = [-0.3, 0.3]
+        
+        # Se abbiamo lo stato corrente, partiamo da lì
+        if current_state is not None:
+            # current_state: (B, num_features)
+            # Costruisci traiettoria incrementale
+            base = current_state.unsqueeze(1).unsqueeze(1)  # (B, 1, 1, F)
+            # Accumula i delta
+            traj_modes = base + torch.cumsum(traj_deltas, dim=2)
+        else:
+            # Prima finestra: usa start_pos se disponibile
+            if start_pos is not None:
+                # start_pos: (B, 2) - costruisci base senza inplace ops
+                base_pos = torch.cat([
+                    start_pos,  # (B, 2)
+                    torch.zeros(B, self.num_features - 2, device=device)  # (B, F-2)
+                ], dim=1)  # (B, F)
+                base = base_pos.unsqueeze(1).unsqueeze(1)  # (B, 1, 1, F)
+                traj_modes = base + torch.cumsum(traj_deltas, dim=2)
+            else:
+                # Fallback: solo delta cumulativi
+                traj_modes = torch.cumsum(traj_deltas, dim=2)
+        
+        # Clamp posizioni a [0, 1] per dati normalizzati (NON inplace!)
+        pos_clamped = torch.clamp(traj_modes[:, :, :, :2], 0.0, 1.0)
+        
+        # Clamp velocità a [0, 1] (NON inplace!)
+        if self.num_features > 2:
+            vel_clamped = torch.clamp(traj_modes[:, :, :, 2:], 0.0, 1.0)
+            traj_modes = torch.cat([pos_clamped, vel_clamped], dim=-1)
+        else:
+            traj_modes = pos_clamped
         
         # Mode probabilities
         mode_probs = F.softmax(self.mode_head(output[:, 0, :]), dim=-1)
@@ -335,6 +376,7 @@ class RecedingHorizonDecoder(nn.Module):
         z: torch.Tensor,
         total_length: int,
         mode: str = "best",  # "best", "sample", "weighted"
+        start_pos: Optional[torch.Tensor] = None,  # (B, 2) posizione iniziale
     ) -> torch.Tensor:
         """
         Genera traiettoria completa con rollout.
@@ -354,6 +396,7 @@ class RecedingHorizonDecoder(nn.Module):
                 context, ego_cond, vehicle_feats, z,
                 current_state=current_state,
                 time_offset=t,
+                start_pos=start_pos if t == 0 else None,  # Solo prima finestra
             )
             
             # Select mode
@@ -479,6 +522,9 @@ class ContextConditionedTransformer(nn.Module):
         # Project noise
         z_proj = self.noise_proj(z)
         
+        # Extract start position from S (first 2 values are x_start, y_start)
+        start_pos = S[:, :2]
+        
         # Generate trajectory
         trajectory = self.decoder(
             context=context,
@@ -486,6 +532,7 @@ class ContextConditionedTransformer(nn.Module):
             vehicle_feats=vehicle_feats,
             z=z_proj,
             total_length=target_len,
+            start_pos=start_pos,
         )
         
         return trajectory
@@ -536,6 +583,9 @@ class ContextConditionedTransformer(nn.Module):
         B = z.size(0)
         device = z.device
         
+        # Extract start position
+        start_pos = S[:, :2]
+        
         # Encode
         if C is not None:
             context, vehicle_feats = self.context_encoder(C, ctx_mask)
@@ -556,6 +606,7 @@ class ContextConditionedTransformer(nn.Module):
             modes, probs = self.decoder.forward_window(
                 context, ego_cond, vehicle_feats, z_proj,
                 current_state, time_offset=t,
+                start_pos=start_pos if t == 0 else None,
             )
             
             steps = min(self.decoder.use_length, self.seq_len - t)
