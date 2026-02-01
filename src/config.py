@@ -46,7 +46,7 @@ class Config:
     batch_size: int = 256              # Aumentato da 32 (RTX 4080 ha 16GB)
     gradient_accumulation_steps: int = 2  # Effective batch = 256
     learning_rate: float = 2e-4        # Aumentato per batch più grande
-    num_epochs: int = 200
+    num_epochs: int = 300
     warmup_epochs: int = 10
     
     # ============== Loss Weights ==============
@@ -55,6 +55,13 @@ class Config:
     weight_smoothness: float = 1.0     # Penalizza accelerazioni brusche (aumentato)
     weight_diversity: float = 0.5      # Diversità tra modi (aumentato per evitare mode collapse)
     weight_collision: float = 0.1      # Evita collisioni (ridotto - era troppo dominante)
+    weight_lane: float = 10.0           # NEW: Lane keeping (penalizza uscite di carreggiata)
+    
+    # Lane keeping parameters
+    # lane_half_width in normalized space = 1.5m / avg_range
+    # avg_range = (479.77 + 287.81) / 2 = 383.79m
+    # So 1.5m ≈ 0.0039 in normalized [0,1] space
+    lane_half_width_normalized: float = 0.004
     
     # ============== Regularization ==============
     weight_decay: float = 0.01
@@ -63,6 +70,14 @@ class Config:
     # ============== Misc ==============
     save_every: int = 20
     device: str = "cuda"
+    
+    # ============== Normalization Scale (from normalization_params.pkl) ==============
+    # Real world ranges: x=[-1.6, 478.17], y=[0.1, 287.91]
+    x_range_meters: float = 479.77  # 478.17 - (-1.6)
+    y_range_meters: float = 287.81  # 287.91 - 0.1
+    
+    # ============== Lane Keeping Evaluation ==============
+    lane_half_width_meters: float = 1.5  # ±1.5m dalla centerline (carreggiata 3m totali)
     
     def __post_init__(self):
         self.data_dir = Path(self.data_dir)

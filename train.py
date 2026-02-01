@@ -20,7 +20,7 @@ from src.utils import (
 def train_epoch(model, loader, optimizer, scheduler, config, device):
     model.train()
     
-    accum = {'total': 0, 'mse': 0, 'endpoint': 0, 'smooth': 0, 'diverse': 0, 'collision': 0}
+    accum = {'total': 0, 'mse': 0, 'endpoint': 0, 'smooth': 0, 'diverse': 0, 'collision': 0, 'lane': 0}
     n = 0
     
     optimizer.zero_grad()
@@ -47,6 +47,8 @@ def train_epoch(model, loader, optimizer, scheduler, config, device):
             w_smooth=config.weight_smoothness,
             w_diverse=config.weight_diversity,
             w_collision=config.weight_collision,
+            w_lane=config.weight_lane,
+            lane_half_width=config.lane_half_width_normalized,
         )
         
         loss = loss / config.gradient_accumulation_steps
@@ -70,7 +72,7 @@ def train_epoch(model, loader, optimizer, scheduler, config, device):
 def validate(model, loader, config, device):
     model.eval()
 
-    accum = {'total': 0, 'mse': 0, 'endpoint': 0}
+    accum = {'total': 0, 'mse': 0, 'endpoint': 0, 'lane': 0}
     n = 0
 
     for batch in loader:
@@ -94,6 +96,8 @@ def validate(model, loader, config, device):
             w_smooth=config.weight_smoothness,
             w_diverse=config.weight_diversity,
             w_collision=config.weight_collision,
+            w_lane=config.weight_lane,
+            lane_half_width=config.lane_half_width_normalized,
             # use_wta=True (default)
         )
 

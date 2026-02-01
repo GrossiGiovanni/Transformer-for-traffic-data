@@ -6,27 +6,198 @@ Metriche:
 - FDE (Final Displacement Error): errore sul punto finale
 - Collision Rate: percentuale di traiettorie che collidono col contesto
 - Miss Rate: percentuale di traiettorie che mancano il target finale
+- Lane Keeping Rate (LKR): percentuale di punti che rimangono in carreggiata (±1.5m)
+- Lateral Deviation: deviazione laterale dalla traiettoria GT (centerline)
 
 Visualizzazioni:
 - Grid di sample con GT vs Generated
 - Distribuzione errori
 - Analisi per lunghezza traiettoria
-- Heatmap delle traiettorie
+- Lane keeping analysis con visualizzazione carreggiata
 """
 
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
+from matplotlib.patches import Polygon
+from matplotlib.collections import PatchCollection
 from pathlib import Path
 import argparse
 from tqdm import tqdm
 import json
+import pickle
 
 from src.config import config
 from src.model import ContextConditionedTransformer, count_parameters
 from src.dataset import TrajectoryDataset, get_dataloaders
 
+
+# ============================================================================
+# LANE KEEPING METRICS
+# ============================================================================
+
+def compute_lateral_deviation(gt_traj: np.ndarray, pred_traj: np.ndarray) -> dict:
+    """
+    Calcola la deviazione laterale della traiettoria predetta rispetto alla GT.
+    
+    La deviazione laterale è la componente PERPENDICOLARE alla direzione di marcia,
+    ovvero quanto il veicolo si sposta lateralmente rispetto alla centerline (GT).
+    
+    Questo è diverso dalla distanza euclidea (ADE) che include anche l'errore 
+    longitudinale (avanti/indietro lungo la direzione di marcia).
+    
+    Args:
+        gt_traj: (T, 2+) ground truth trajectory [x, y, ...]
+        pred_traj: (T, 2+) predicted trajectory [x, y, ...]
+    
+    Returns:
+        dict con:
+        - lateral_devs: (T,) deviazione laterale per ogni punto (con segno)
+        - abs_lateral_devs: (T,) deviazione laterale assoluta
+        - tangent_dirs: (T, 2) direzioni tangenti alla GT
+        - normal_dirs: (T, 2) direzioni normali alla GT
+    """
+    T = len(gt_traj)
+    
+    if T < 2:
+        return {
+            'lateral_devs': np.zeros(T),
+            'abs_lateral_devs': np.zeros(T),
+            'tangent_dirs': np.zeros((T, 2)),
+            'normal_dirs': np.zeros((T, 2)),
+        }
+    
+    gt_xy = gt_traj[:, :2]
+    pred_xy = pred_traj[:, :2]
+    
+    # Calcola direzioni tangenti alla traiettoria GT
+    # Usa differenze finite con smoothing per stimare la direzione locale
+    tangent_dirs = np.zeros((T, 2))
+    
+    for t in range(T):
+        if t == 0:
+            # Primo punto: usa la direzione verso il secondo
+            direction = gt_xy[min(1, T-1)] - gt_xy[0]
+        elif t == T - 1:
+            # Ultimo punto: usa la direzione dall'penultimo all'ultimo
+            direction = gt_xy[t] - gt_xy[t-1]
+        else:
+            # Punti intermedi: media delle direzioni (smoothing)
+            dir_forward = gt_xy[t+1] - gt_xy[t]
+            dir_backward = gt_xy[t] - gt_xy[t-1]
+            direction = (dir_forward + dir_backward) / 2
+        
+        # Normalizza
+        norm = np.linalg.norm(direction)
+        if norm > 1e-8:
+            tangent_dirs[t] = direction / norm
+        else:
+            # Se la traiettoria è ferma, usa la direzione precedente o (1,0)
+            if t > 0:
+                tangent_dirs[t] = tangent_dirs[t-1]
+            else:
+                tangent_dirs[t] = np.array([1.0, 0.0])
+    
+    # Calcola la normale (perpendicolare) alla direzione tangente
+    # Ruota di 90° in senso antiorario: (dx, dy) -> (-dy, dx)
+    normal_dirs = np.zeros_like(tangent_dirs)
+    normal_dirs[:, 0] = -tangent_dirs[:, 1]
+    normal_dirs[:, 1] = tangent_dirs[:, 0]
+    
+    # Vettore differenza tra predizione e GT
+    diff = pred_xy - gt_xy  # (T, 2)
+    
+    # Deviazione laterale = proiezione della differenza sulla normale
+    # Positivo = a sinistra della GT, Negativo = a destra
+    lateral_devs = np.sum(diff * normal_dirs, axis=1)  # (T,)
+    
+    return {
+        'lateral_devs': lateral_devs,
+        'abs_lateral_devs': np.abs(lateral_devs),
+        'tangent_dirs': tangent_dirs,
+        'normal_dirs': normal_dirs,
+    }
+
+
+def compute_lane_keeping_metrics(
+    gt_traj: np.ndarray, 
+    pred_traj: np.ndarray,
+    x_range_meters: float = 479.77,
+    y_range_meters: float = 287.81,
+    lane_half_width_meters: float = 1.5,
+) -> dict:
+    """
+    Calcola metriche di Lane Keeping.
+    
+    La "carreggiata" è definita come un corridoio di ±1.5m (totale 3m) 
+    attorno alla traiettoria ground truth (che funge da centerline).
+    
+    Args:
+        gt_traj: (T, 2+) ground truth trajectory [x, y, ...]
+        pred_traj: (T, 2+) predicted trajectory [x, y, ...]
+        x_range_meters: range in metri dell'asse x (per conversione da normalizzato)
+        y_range_meters: range in metri dell'asse y
+        lane_half_width_meters: mezza larghezza carreggiata in metri (default ±1.5m)
+    
+    Returns:
+        dict con tutte le metriche di lane keeping
+    """
+    # Calcola deviazioni laterali in unità normalizzate
+    dev_result = compute_lateral_deviation(gt_traj, pred_traj)
+    
+    lateral_devs_signed = dev_result['lateral_devs']  # Con segno
+    lateral_devs_norm = dev_result['abs_lateral_devs']  # Assolute, in unità normalizzate
+    
+    # Per convertire in metri, usiamo la media delle scale x e y
+    # (assumendo che la deviazione laterale possa essere in qualsiasi direzione)
+    avg_meters_per_unit = (x_range_meters + y_range_meters) / 2
+    
+    # Converti in metri
+    lateral_devs_m = lateral_devs_norm * avg_meters_per_unit
+    lateral_devs_signed_m = lateral_devs_signed * avg_meters_per_unit
+    
+    # Soglia in unità normalizzate
+    lane_half_width_norm = lane_half_width_meters / avg_meters_per_unit
+    
+    # Lane Keeping Rate: % di punti entro la carreggiata
+    in_lane = lateral_devs_norm <= lane_half_width_norm
+    lane_keeping_rate = in_lane.mean() * 100  # percentuale
+    
+    # Statistiche deviazione laterale
+    metrics = {
+        # In unità normalizzate (compatibile con ADE/FDE)
+        'lateral_dev_mean_norm': float(lateral_devs_norm.mean()),
+        'lateral_dev_max_norm': float(lateral_devs_norm.max()),
+        'lateral_dev_std_norm': float(lateral_devs_norm.std()),
+        
+        # In metri (più interpretabile)
+        'lateral_dev_mean_m': float(lateral_devs_m.mean()),
+        'lateral_dev_max_m': float(lateral_devs_m.max()),
+        'lateral_dev_std_m': float(lateral_devs_m.std()),
+        
+        # Lane keeping
+        'lane_keeping_rate': float(lane_keeping_rate),  # %
+        'out_of_lane_count': int((~in_lane).sum()),
+        'total_points': int(len(in_lane)),
+        
+        # Threshold info
+        'lane_half_width_norm': float(lane_half_width_norm),
+        'lane_half_width_m': float(lane_half_width_meters),
+        
+        # Raw data per analisi dettagliata
+        'lateral_devs_norm': lateral_devs_norm,
+        'lateral_devs_signed_m': lateral_devs_signed_m,
+        'in_lane_mask': in_lane,
+        'normal_dirs': dev_result['normal_dirs'],
+    }
+    
+    return metrics
+
+
+# ============================================================================
+# MODEL LOADING
+# ============================================================================
 
 def load_model(checkpoint_path, cfg, device):
     """Carica il modello."""
@@ -54,9 +225,13 @@ def load_model(checkpoint_path, cfg, device):
     return model, ckpt
 
 
+# ============================================================================
+# BATCH EVALUATION
+# ============================================================================
+
 @torch.no_grad()
 def evaluate_batch(model, batch, cfg, device):
-    """Valuta un batch e ritorna metriche."""
+    """Valuta un batch e ritorna metriche incluso lane keeping."""
     X = batch['X'].to(device)
     S = batch['S'].to(device)
     C = batch['C'].to(device)
@@ -102,6 +277,15 @@ def evaluate_batch(model, batch, cfg, device):
         
         collision = min_dist_to_ctx < 0.03  # 3% dello spazio = collisione
         
+        # ========== LANE KEEPING METRICS ==========
+        lk_metrics = compute_lane_keeping_metrics(
+            gt_traj=gt,
+            pred_traj=gen,
+            x_range_meters=cfg.x_range_meters,
+            y_range_meters=cfg.y_range_meters,
+            lane_half_width_meters=cfg.lane_half_width_meters,
+        )
+        
         results.append({
             'length': length,
             'ade': ade,
@@ -110,6 +294,12 @@ def evaluate_batch(model, batch, cfg, device):
             'miss': miss,
             'collision': collision,
             'min_dist_ctx': min_dist_to_ctx if min_dist_to_ctx != float('inf') else 1.0,
+            # Lane keeping metrics
+            'lane_keeping_rate': lk_metrics['lane_keeping_rate'],
+            'lateral_dev_mean_m': lk_metrics['lateral_dev_mean_m'],
+            'lateral_dev_max_m': lk_metrics['lateral_dev_max_m'],
+            'lateral_dev_mean_norm': lk_metrics['lateral_dev_mean_norm'],
+            'out_of_lane_count': lk_metrics['out_of_lane_count'],
         })
     
     return results
@@ -130,8 +320,12 @@ def evaluate_full(model, dataloader, cfg, device, max_batches=None):
     return all_results
 
 
+# ============================================================================
+# METRICS AGGREGATION
+# ============================================================================
+
 def compute_metrics(results):
-    """Calcola metriche aggregate."""
+    """Calcola metriche aggregate incluso lane keeping."""
     ades = [r['ade'] for r in results]
     fdes = [r['fde'] for r in results]
     start_errs = [r['start_err'] for r in results]
@@ -139,6 +333,12 @@ def compute_metrics(results):
     collisions = [r['collision'] for r in results]
     min_dists = [r['min_dist_ctx'] for r in results]
     lengths = [r['length'] for r in results]
+    
+    # Lane keeping metrics
+    lkrs = [r['lane_keeping_rate'] for r in results]
+    lat_devs_m = [r['lateral_dev_mean_m'] for r in results]
+    lat_devs_max_m = [r['lateral_dev_max_m'] for r in results]
+    out_of_lane = [r['out_of_lane_count'] for r in results]
     
     metrics = {
         'n_samples': len(results),
@@ -153,16 +353,28 @@ def compute_metrics(results):
         'collision_rate': float(np.mean(collisions) * 100),
         'min_dist_ctx_mean': float(np.mean(min_dists)),
         'length_mean': float(np.mean(lengths)),
+        
+        # ========== LANE KEEPING AGGREGATE ==========
+        'lane_keeping_rate_mean': float(np.mean(lkrs)),
+        'lane_keeping_rate_std': float(np.std(lkrs)),
+        'lane_keeping_rate_median': float(np.median(lkrs)),
+        'lane_keeping_rate_min': float(np.min(lkrs)),
+        'lateral_dev_mean_m': float(np.mean(lat_devs_m)),
+        'lateral_dev_max_m_mean': float(np.mean(lat_devs_max_m)),
+        'lateral_dev_max_m_worst': float(np.max(lat_devs_max_m)),
+        'out_of_lane_total': int(np.sum(out_of_lane)),
+        'trajectories_always_in_lane': int(sum(1 for lkr in lkrs if lkr == 100.0)),
+        'trajectories_always_in_lane_pct': float(sum(1 for lkr in lkrs if lkr == 100.0) / len(lkrs) * 100),
     }
     
     return metrics
 
 
 def print_metrics(metrics):
-    """Stampa metriche formattate."""
-    print("\n" + "=" * 60)
+    """Stampa metriche formattate incluso lane keeping."""
+    print("\n" + "=" * 70)
     print("EVALUATION METRICS")
-    print("=" * 60)
+    print("=" * 70)
     
     print(f"\nSamples evaluated: {metrics['n_samples']}")
     print(f"Average trajectory length: {metrics['length_mean']:.1f}")
@@ -174,17 +386,26 @@ def print_metrics(metrics):
     print(f"FDE (Median):   {metrics['fde_median']:.6f}")
     print(f"Start Error:    {metrics['start_err_mean']:.6f}")
     
-    print(f"\n--- Rates (lower is better) ---")
+    print(f"\n--- Rates ---")
     print(f"Miss Rate:      {metrics['miss_rate']:.2f}%")
     print(f"Collision Rate: {metrics['collision_rate']:.2f}%")
     
-    print(f"\n--- Context Awareness ---")
-    print(f"Min Dist to Context: {metrics['min_dist_ctx_mean']:.4f}")
+    print(f"\n" + "-" * 70)
+    print("🚗 LANE KEEPING METRICS (carreggiata ±1.5m = 3m totali)")
+    print("-" * 70)
+    print(f"Lane Keeping Rate (LKR):  {metrics['lane_keeping_rate_mean']:.2f}% ± {metrics['lane_keeping_rate_std']:.2f}%")
+    print(f"LKR Median:               {metrics['lane_keeping_rate_median']:.2f}%")
+    print(f"LKR Worst:                {metrics['lane_keeping_rate_min']:.2f}%")
+    print(f"Trajectories 100% in lane: {metrics['trajectories_always_in_lane']} ({metrics['trajectories_always_in_lane_pct']:.1f}%)")
+    print(f"\nLateral Deviation (mean): {metrics['lateral_dev_mean_m']:.3f} m")
+    print(f"Lateral Deviation (max avg): {metrics['lateral_dev_max_m_mean']:.3f} m")
+    print(f"Lateral Deviation (worst): {metrics['lateral_dev_max_m_worst']:.3f} m")
+    print(f"Total out-of-lane points: {metrics['out_of_lane_total']}")
     
     # Interpretation
-    print(f"\n--- Interpretation (data in [0,1]) ---")
+    print(f"\n--- Interpretation ---")
     ade_pct = metrics['ade_mean'] * 100
-    fde_pct = metrics['fde_mean'] * 100
+    lkr = metrics['lane_keeping_rate_mean']
     
     if ade_pct < 3:
         print(f"ADE {ade_pct:.1f}% → EXCELLENT")
@@ -195,12 +416,25 @@ def print_metrics(metrics):
     else:
         print(f"ADE {ade_pct:.1f}% → NEEDS IMPROVEMENT")
     
-    print("=" * 60)
+    if lkr >= 95:
+        print(f"LKR {lkr:.1f}% → EXCELLENT (quasi sempre in carreggiata)")
+    elif lkr >= 85:
+        print(f"LKR {lkr:.1f}% → GOOD (raramente fuori carreggiata)")
+    elif lkr >= 70:
+        print(f"LKR {lkr:.1f}% → ACCEPTABLE (alcune deviazioni)")
+    else:
+        print(f"LKR {lkr:.1f}% → NEEDS IMPROVEMENT (frequenti uscite di carreggiata)")
+    
+    print("=" * 70)
 
+
+# ============================================================================
+# VISUALIZATION
+# ============================================================================
 
 @torch.no_grad()
 def get_samples_for_viz(model, dataset, cfg, device, n_samples=16, seed=42):
-    """Ottieni sample per visualizzazione."""
+    """Ottieni sample per visualizzazione con metriche lane keeping."""
     np.random.seed(seed)
     indices = np.random.choice(len(dataset), size=n_samples, replace=False)
     
@@ -218,6 +452,15 @@ def get_samples_for_viz(model, dataset, cfg, device, n_samples=16, seed=42):
         pred = model(z, S, C, ctx_mask, target_len=length)
         pred = pred[0].cpu().numpy()
         
+        # Calcola lane keeping per questo sample
+        lk_metrics = compute_lane_keeping_metrics(
+            gt_traj=X,
+            pred_traj=pred,
+            x_range_meters=cfg.x_range_meters,
+            y_range_meters=cfg.y_range_meters,
+            lane_half_width_meters=cfg.lane_half_width_meters,
+        )
+        
         samples.append({
             'idx': idx,
             'length': length,
@@ -226,13 +469,73 @@ def get_samples_for_viz(model, dataset, cfg, device, n_samples=16, seed=42):
             'S': sample['S'].numpy(),
             'C': sample['C'].numpy(),
             'ctx_mask': sample['ctx_mask'].numpy(),
+            'lk_metrics': lk_metrics,
         })
     
     return samples
 
 
+def plot_trajectory_with_lane(ax, gt, pred, lk_metrics, title="", show_lane=True):
+    """
+    Plot traiettoria con visualizzazione della carreggiata.
+    
+    La carreggiata è mostrata come un corridoio attorno alla GT.
+    """
+    gt_xy = gt[:, :2]
+    pred_xy = pred[:, :2]
+    
+    # Disegna la carreggiata come poligono
+    if show_lane and len(gt_xy) > 1:
+        lane_half_width = lk_metrics['lane_half_width_norm']
+        normal_dirs = lk_metrics['normal_dirs']
+        
+        # Bordi della carreggiata
+        left_border = gt_xy + normal_dirs * lane_half_width
+        right_border = gt_xy - normal_dirs * lane_half_width
+        
+        # Crea poligono della carreggiata
+        lane_polygon = np.vstack([left_border, right_border[::-1]])
+        lane_patch = Polygon(lane_polygon, alpha=0.2, color='green', label='Lane (±1.5m)')
+        ax.add_patch(lane_patch)
+    
+    # Colora i punti fuori carreggiata
+    in_lane = lk_metrics['in_lane_mask']
+    
+    # Traiettoria GT (centerline)
+    ax.plot(gt_xy[:, 0], gt_xy[:, 1], 'g-', linewidth=2, label='GT (centerline)', zorder=3)
+    
+    # Traiettoria predetta - punti in carreggiata
+    pred_in = pred_xy[in_lane]
+    if len(pred_in) > 0:
+        ax.scatter(pred_in[:, 0], pred_in[:, 1], c='blue', s=10, alpha=0.7, zorder=4)
+    
+    # Traiettoria predetta - punti fuori carreggiata (in rosso)
+    pred_out = pred_xy[~in_lane]
+    if len(pred_out) > 0:
+        ax.scatter(pred_out[:, 0], pred_out[:, 1], c='red', s=20, marker='x', 
+                   label=f'Out of lane ({(~in_lane).sum()})', zorder=5)
+    
+    # Linea predetta
+    ax.plot(pred_xy[:, 0], pred_xy[:, 1], 'b--', linewidth=1.5, alpha=0.7, label='Pred', zorder=3)
+    
+    # Start/End markers
+    ax.scatter([gt_xy[0, 0]], [gt_xy[0, 1]], c='green', s=100, marker='o', 
+               edgecolors='black', linewidths=1, zorder=6)
+    ax.scatter([gt_xy[-1, 0]], [gt_xy[-1, 1]], c='red', s=100, marker='X', 
+               edgecolors='black', linewidths=1, zorder=6)
+    
+    lkr = lk_metrics['lane_keeping_rate']
+    lat_dev = lk_metrics['lateral_dev_mean_m']
+    ax.set_title(f"{title}\nLKR={lkr:.1f}%, LatDev={lat_dev:.2f}m", fontsize=9)
+    
+    ax.set_xlim(-0.05, 1.05)
+    ax.set_ylim(-0.05, 1.05)
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+
+
 def plot_trajectory_grid(samples, save_path=None, cols=4):
-    """Plot grid di traiettorie."""
+    """Plot grid di traiettorie con lane keeping."""
     n = len(samples)
     rows = (n + cols - 1) // cols
     
@@ -242,40 +545,25 @@ def plot_trajectory_grid(samples, save_path=None, cols=4):
     for i, (ax, sample) in enumerate(zip(axes, samples)):
         gt = sample['gt']
         pred = sample['pred']
-        S = sample['S']
+        lk_metrics = sample['lk_metrics']
         C = sample['C']
         ctx_mask = sample['ctx_mask']
         
-        # Ground truth
-        ax.plot(gt[:, 0], gt[:, 1], 'g-', linewidth=2, label='GT', alpha=0.7)
-        
-        # Prediction
-        ax.plot(pred[:, 0], pred[:, 1], 'b--', linewidth=2, label='Pred')
-        
-        # Start/End
-        ax.scatter([S[0]], [S[1]], c='green', s=100, marker='o', zorder=10, edgecolors='black')
-        ax.scatter([S[2]], [S[3]], c='red', s=100, marker='X', zorder=10, edgecolors='black')
-        
-        # Context vehicles
+        # Disegna context vehicles
         for j in range(len(ctx_mask)):
             if not ctx_mask[j]:
-                ax.scatter([C[j, 0]], [C[j, 1]], c='orange', s=80, marker='s', edgecolors='black')
+                cx, cy = C[j, :2]
+                ax.scatter([cx], [cy], c='orange', s=60, marker='s', alpha=0.7)
         
-        # Error
-        ade = np.sqrt(((gt[:, :2] - pred[:, :2]) ** 2).sum(axis=1)).mean()
-        ax.set_title(f"#{sample['idx']} (ADE={ade:.4f})", fontsize=10)
-        
-        ax.set_xlim(-0.05, 1.05)
-        ax.set_ylim(-0.05, 1.05)
-        ax.set_aspect('equal')
-        ax.grid(True, alpha=0.3)
+        plot_trajectory_with_lane(ax, gt, pred, lk_metrics, 
+                                   title=f"Sample {sample['idx']}")
         
         if i == 0:
-            ax.legend(loc='upper right', fontsize=8)
+            ax.legend(fontsize=7, loc='upper right')
     
-    # Hide empty axes
-    for ax in axes[n:]:
-        ax.axis('off')
+    # Hide unused axes
+    for j in range(i+1, len(axes)):
+        axes[j].axis('off')
     
     plt.tight_layout()
     
@@ -287,7 +575,7 @@ def plot_trajectory_grid(samples, save_path=None, cols=4):
 
 
 def plot_error_distribution(results, save_path=None):
-    """Plot distribuzione degli errori."""
+    """Plot distribuzioni errori incluso lane keeping."""
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
     
     ades = [r['ade'] for r in results]
@@ -295,12 +583,13 @@ def plot_error_distribution(results, save_path=None):
     start_errs = [r['start_err'] for r in results]
     lengths = [r['length'] for r in results]
     min_dists = [r['min_dist_ctx'] for r in results]
+    lkrs = [r['lane_keeping_rate'] for r in results]
+    lat_devs = [r['lateral_dev_mean_m'] for r in results]
     
     # ADE histogram
     ax = axes[0, 0]
-    ax.hist(ades, bins=50, edgecolor='black', alpha=0.7, color='blue')
+    ax.hist(ades, bins=50, edgecolor='black', alpha=0.7, color='steelblue')
     ax.axvline(np.mean(ades), color='red', linestyle='--', label=f'Mean: {np.mean(ades):.4f}')
-    ax.axvline(np.median(ades), color='orange', linestyle='--', label=f'Median: {np.median(ades):.4f}')
     ax.set_xlabel('ADE')
     ax.set_ylabel('Count')
     ax.set_title('Average Displacement Error Distribution')
@@ -308,29 +597,28 @@ def plot_error_distribution(results, save_path=None):
     
     # FDE histogram
     ax = axes[0, 1]
-    ax.hist(fdes, bins=50, edgecolor='black', alpha=0.7, color='green')
+    ax.hist(fdes, bins=50, edgecolor='black', alpha=0.7, color='coral')
     ax.axvline(np.mean(fdes), color='red', linestyle='--', label=f'Mean: {np.mean(fdes):.4f}')
     ax.set_xlabel('FDE')
     ax.set_ylabel('Count')
     ax.set_title('Final Displacement Error Distribution')
     ax.legend()
     
-    # Start error histogram
+    # Lane Keeping Rate histogram
     ax = axes[0, 2]
-    ax.hist(start_errs, bins=50, edgecolor='black', alpha=0.7, color='purple')
-    ax.axvline(np.mean(start_errs), color='red', linestyle='--', label=f'Mean: {np.mean(start_errs):.4f}')
-    ax.set_xlabel('Start Error')
+    ax.hist(lkrs, bins=50, edgecolor='black', alpha=0.7, color='green')
+    ax.axvline(np.mean(lkrs), color='red', linestyle='--', label=f'Mean: {np.mean(lkrs):.1f}%')
+    ax.axvline(100, color='darkgreen', linestyle='-', linewidth=2, alpha=0.5, label='Perfect (100%)')
+    ax.set_xlabel('Lane Keeping Rate (%)')
     ax.set_ylabel('Count')
-    ax.set_title('Start Point Error Distribution')
+    ax.set_title('Lane Keeping Rate Distribution')
     ax.legend()
     
     # ADE vs Length
     ax = axes[1, 0]
     ax.scatter(lengths, ades, alpha=0.3, s=10)
-    # Binned mean
     bins = np.linspace(min(lengths), max(lengths), 10)
-    bin_centers = []
-    bin_means = []
+    bin_centers, bin_means = [], []
     for j in range(len(bins)-1):
         mask = (np.array(lengths) >= bins[j]) & (np.array(lengths) < bins[j+1])
         if mask.sum() > 0:
@@ -342,28 +630,31 @@ def plot_error_distribution(results, save_path=None):
     ax.set_title('ADE vs Trajectory Length')
     ax.legend()
     
-    # Min distance to context
+    # LKR vs Length
     ax = axes[1, 1]
-    ax.hist(min_dists, bins=50, edgecolor='black', alpha=0.7, color='orange')
-    ax.axvline(0.03, color='red', linestyle='--', label='Collision threshold')
-    ax.set_xlabel('Min Distance to Context')
-    ax.set_ylabel('Count')
-    ax.set_title('Minimum Distance to Context Vehicles')
+    ax.scatter(lengths, lkrs, alpha=0.3, s=10, color='green')
+    bin_centers, bin_means = [], []
+    for j in range(len(bins)-1):
+        mask = (np.array(lengths) >= bins[j]) & (np.array(lengths) < bins[j+1])
+        if mask.sum() > 0:
+            bin_centers.append((bins[j] + bins[j+1]) / 2)
+            bin_means.append(np.mean(np.array(lkrs)[mask]))
+    ax.plot(bin_centers, bin_means, 'darkgreen', marker='o', linewidth=2, markersize=8, label='Binned mean')
+    ax.set_xlabel('Trajectory Length')
+    ax.set_ylabel('Lane Keeping Rate (%)')
+    ax.set_title('LKR vs Trajectory Length')
+    ax.axhline(85, color='orange', linestyle='--', alpha=0.5, label='Good threshold (85%)')
     ax.legend()
     
-    # Error over time (average)
+    # Lateral Deviation histogram
     ax = axes[1, 2]
-    max_len = max(lengths)
-    errors_over_time = np.zeros(max_len)
-    counts = np.zeros(max_len)
-    
-    for r, sample in zip(results[:1000], range(min(1000, len(results)))):  # Limit for speed
-        # We need to recompute per-timestep error
-        pass  # Skip for now, would need GT data
-    
-    ax.text(0.5, 0.5, 'Aggregate metrics\nshown in other plots', 
-            ha='center', va='center', transform=ax.transAxes, fontsize=12)
-    ax.set_title('Summary')
+    ax.hist(lat_devs, bins=50, edgecolor='black', alpha=0.7, color='purple')
+    ax.axvline(np.mean(lat_devs), color='red', linestyle='--', label=f'Mean: {np.mean(lat_devs):.2f}m')
+    ax.axvline(1.5, color='darkred', linestyle='-', linewidth=2, alpha=0.5, label='Lane boundary (1.5m)')
+    ax.set_xlabel('Mean Lateral Deviation (m)')
+    ax.set_ylabel('Count')
+    ax.set_title('Lateral Deviation Distribution')
+    ax.legend()
     
     plt.tight_layout()
     
@@ -374,56 +665,32 @@ def plot_error_distribution(results, save_path=None):
     plt.show()
 
 
-def plot_best_worst(samples, results, save_path=None, n=4):
-    """Plot best e worst predictions."""
-    # Sort by ADE
-    sorted_indices = np.argsort([r['ade'] for r in results])
+def plot_best_worst_lane_keeping(samples, save_path=None, n=4):
+    """Plot best e worst predictions per Lane Keeping Rate."""
+    # Sort by LKR (best = highest)
+    sorted_samples = sorted(samples, key=lambda s: s['lk_metrics']['lane_keeping_rate'], reverse=True)
     
     fig, axes = plt.subplots(2, n, figsize=(4*n, 8))
     
-    # Best
-    for i in range(n):
+    # Best LKR
+    for i in range(min(n, len(sorted_samples))):
         ax = axes[0, i]
-        idx = sorted_indices[i]
-        if idx < len(samples):
-            sample = samples[idx]
-            gt = sample['gt']
-            pred = sample['pred']
-            
-            ax.plot(gt[:, 0], gt[:, 1], 'g-', linewidth=2, label='GT')
-            ax.plot(pred[:, 0], pred[:, 1], 'b--', linewidth=2, label='Pred')
-            
-            ade = results[idx]['ade']
-            ax.set_title(f"Best #{i+1}\nADE={ade:.4f}", fontsize=10)
-        ax.set_xlim(-0.05, 1.05)
-        ax.set_ylim(-0.05, 1.05)
-        ax.set_aspect('equal')
-        ax.grid(True, alpha=0.3)
+        sample = sorted_samples[i]
+        plot_trajectory_with_lane(ax, sample['gt'], sample['pred'], 
+                                   sample['lk_metrics'], title=f"Best #{i+1}")
         if i == 0:
-            ax.legend(fontsize=8)
+            ax.legend(fontsize=7)
     
-    axes[0, 0].set_ylabel('BEST', fontsize=14, fontweight='bold')
+    axes[0, 0].set_ylabel('BEST LKR', fontsize=14, fontweight='bold')
     
-    # Worst
-    for i in range(n):
+    # Worst LKR
+    for i in range(min(n, len(sorted_samples))):
         ax = axes[1, i]
-        idx = sorted_indices[-(i+1)]
-        if idx < len(samples):
-            sample = samples[idx]
-            gt = sample['gt']
-            pred = sample['pred']
-            
-            ax.plot(gt[:, 0], gt[:, 1], 'g-', linewidth=2, label='GT')
-            ax.plot(pred[:, 0], pred[:, 1], 'b--', linewidth=2, label='Pred')
-            
-            ade = results[idx]['ade']
-            ax.set_title(f"Worst #{i+1}\nADE={ade:.4f}", fontsize=10)
-        ax.set_xlim(-0.05, 1.05)
-        ax.set_ylim(-0.05, 1.05)
-        ax.set_aspect('equal')
-        ax.grid(True, alpha=0.3)
+        sample = sorted_samples[-(i+1)]
+        plot_trajectory_with_lane(ax, sample['gt'], sample['pred'],
+                                   sample['lk_metrics'], title=f"Worst #{i+1}")
     
-    axes[1, 0].set_ylabel('WORST', fontsize=14, fontweight='bold')
+    axes[1, 0].set_ylabel('WORST LKR', fontsize=14, fontweight='bold')
     
     plt.tight_layout()
     
@@ -434,10 +701,14 @@ def plot_best_worst(samples, results, save_path=None, n=4):
     plt.show()
 
 
+# ============================================================================
+# MAIN
+# ============================================================================
+
 def main(args):
-    print("=" * 60)
-    print("MODEL EVALUATION")
-    print("=" * 60)
+    print("=" * 70)
+    print("MODEL EVALUATION (with Lane Keeping Metrics)")
+    print("=" * 70)
     
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -446,6 +717,11 @@ def main(args):
     cfg = config
     if args.data_dir:
         cfg.data_dir = Path(args.data_dir)
+    
+    # Override lane width if specified
+    if args.lane_width:
+        cfg.lane_half_width_meters = args.lane_width / 2
+        print(f"Lane width set to: {args.lane_width}m (±{cfg.lane_half_width_meters}m)")
     
     # Dataset
     dataset = TrajectoryDataset(cfg.data_dir, cfg.max_context_vehicles)
@@ -471,6 +747,11 @@ def main(args):
     print(f"  Epoch: {ckpt['epoch']}")
     print(f"  Loss: {ckpt['loss']:.6f}")
     print(f"  Parameters: {count_parameters(model):,}")
+    
+    print(f"\nLane Keeping Config:")
+    print(f"  Lane half-width: ±{cfg.lane_half_width_meters}m (total {cfg.lane_half_width_meters*2}m)")
+    print(f"  X range: {cfg.x_range_meters:.1f}m")
+    print(f"  Y range: {cfg.y_range_meters:.1f}m")
     
     # Output dir
     output_dir = Path(args.output_dir) if args.output_dir else cfg.output_dir
@@ -507,44 +788,52 @@ def main(args):
     # Get samples for visualization
     viz_samples = get_samples_for_viz(model, dataset, cfg, device, n_samples=args.n_viz_samples)
     
-    # Evaluate these specific samples for best/worst
+    # Evaluate these specific samples for sorting
     viz_results = []
     for s in viz_samples:
         gt = s['gt']
         pred = s['pred']
         ade = np.sqrt(((gt[:, :2] - pred[:, :2]) ** 2).sum(axis=1)).mean()
         fde = np.sqrt(((gt[-1, :2] - pred[-1, :2]) ** 2).sum())
-        viz_results.append({'ade': ade, 'fde': fde})
+        lkr = s['lk_metrics']['lane_keeping_rate']
+        lat_dev = s['lk_metrics']['lateral_dev_mean_m']
+        viz_results.append({
+            'ade': ade, 'fde': fde, 
+            'lane_keeping_rate': lkr,
+            'lateral_dev_mean_m': lat_dev,
+            'lateral_dev_max_m': s['lk_metrics']['lateral_dev_max_m'],
+            'out_of_lane_count': s['lk_metrics']['out_of_lane_count'],
+        })
     
-    # Plot 1: Grid of trajectories
-    print("\n1. Trajectory grid...")
+    # Plot 1: Grid of trajectories with lane
+    print("\n1. Trajectory grid with lane visualization...")
     plot_trajectory_grid(
         viz_samples, 
-        save_path=output_dir / "trajectory_grid.png"
+        save_path=output_dir / "trajectory_grid_lane.png"
     )
     
-    # Plot 2: Error distribution
+    # Plot 2: Error distribution (including LKR)
     print("\n2. Error distributions...")
     plot_error_distribution(
         results,
         save_path=output_dir / "error_distribution.png"
     )
     
-    # Plot 3: Best/Worst
-    print("\n3. Best and worst predictions...")
-    plot_best_worst(
-        viz_samples, viz_results,
-        save_path=output_dir / "best_worst.png"
+    # Plot 3: Best/Worst by Lane Keeping
+    print("\n3. Best and worst by Lane Keeping Rate...")
+    plot_best_worst_lane_keeping(
+        viz_samples,
+        save_path=output_dir / "best_worst_lane_keeping.png"
     )
     
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 70)
     print("EVALUATION COMPLETE")
     print(f"Results saved to: {output_dir}")
-    print("=" * 60)
+    print("=" * 70)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate trajectory model")
+    parser = argparse.ArgumentParser(description="Evaluate trajectory model with Lane Keeping metrics")
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--data-dir", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
@@ -554,5 +843,7 @@ if __name__ == "__main__":
                         help="Max batches to evaluate (None = all)")
     parser.add_argument("--n-viz-samples", type=int, default=16,
                         help="Number of samples for visualization")
+    parser.add_argument("--lane-width", type=float, default=None,
+                        help="Total lane width in meters (default: 3.0m = ±1.5m)")
     
     main(parser.parse_args())

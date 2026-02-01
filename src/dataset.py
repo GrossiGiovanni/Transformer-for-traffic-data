@@ -97,15 +97,46 @@ class TrajectoryDataset(Dataset):
         for i, L in enumerate(self.L):
             self.pad_mask[i, :L] = False
         
-        # Context mask: True where vehicle is padding (all zeros)
+        # Context mask: True where vehicle is padding
+        # IMPROVED: Multiple detection strategies for normalized data
         self.ctx_mask = np.zeros((N, N_ctx), dtype=bool)
+        
         for i in range(N):
             for j in range(N_ctx):
-                if np.allclose(self.C[i, j], 0) or np.isnan(self.C[i, j]).any():
-                    self.ctx_mask[i, j] = True
+                ctx_vehicle = self.C[i, j]
+                
+                # Strategy 1: Check if ALL features are exactly 0 (common padding)
+                all_zero = np.allclose(ctx_vehicle, 0, atol=1e-6)
+                
+                # Strategy 2: Check if position (x,y) is at normalized origin
+                # In normalized [0,1] space, (0,0) often indicates padding
+                # because real trajectories rarely start exactly at the min values
+                pos_at_origin = (abs(ctx_vehicle[0]) < 0.01 and abs(ctx_vehicle[1]) < 0.01)
+                
+                # Strategy 3: Check for NaN values
+                has_nan = np.isnan(ctx_vehicle).any()
+                
+                # Strategy 4: Check if speed and angle are also 0 (very unlikely for real vehicle)
+                # A real vehicle at (0,0) would still have some speed or angle
+                all_dynamics_zero = (len(ctx_vehicle) >= 4 and 
+                                    abs(ctx_vehicle[2]) < 1e-6 and 
+                                    abs(ctx_vehicle[3]) < 1e-6)
+                
+                # Mark as padding if:
+                # - All features are zero, OR
+                # - Position at origin AND all dynamics zero, OR  
+                # - Has NaN
+                is_padding = all_zero or (pos_at_origin and all_dynamics_zero) or has_nan
+                
+                self.ctx_mask[i, j] = is_padding
         
         valid = (~self.ctx_mask).sum(axis=1)
         print(f"  Context vehicles: avg {valid.mean():.1f}, min {valid.min()}, max {valid.max()}")
+        
+        # Additional stats
+        total_padding = self.ctx_mask.sum()
+        total_slots = N * N_ctx
+        print(f"  Padding detected: {total_padding:,} / {total_slots:,} ({100*total_padding/total_slots:.1f}%)")
     
     def __len__(self) -> int:
         return len(self.X)

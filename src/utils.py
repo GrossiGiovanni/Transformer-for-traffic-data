@@ -110,6 +110,119 @@ def collision_loss(
     return (penalty.sum(dim=2) / n.squeeze(-1)).mean()
 
 
+def lane_keeping_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    lane_half_width: float = 0.004,  # ~1.5m in normalized space (1.5 / 383.79)
+    margin: float = 0.0,  # Extra margin inside lane for soft boundary
+) -> torch.Tensor:
+    """
+    Lane Keeping Loss - penalizza deviazioni laterali dalla traiettoria GT.
+    
+    La "corsia" è definita come un corridoio di ±lane_half_width attorno alla GT.
+    Questa loss penalizza quadraticamente la distanza laterale oltre il confine.
+    
+    Args:
+        pred: (B, T, F) traiettoria predetta [x, y, ...]
+        target: (B, T, F) traiettoria ground truth (centerline)
+        mask: (B, T) True = padding
+        lane_half_width: mezza larghezza corsia in unità normalizzate
+                        Default: 0.004 ≈ 1.5m per dataset con range ~380m
+        margin: margine aggiuntivo per soft boundary (0 = hard)
+    
+    Returns:
+        Lane keeping loss (scalar)
+    """
+    B, T, _ = pred.shape
+    
+    pred_xy = pred[:, :, :2]  # (B, T, 2)
+    target_xy = target[:, :, :2]  # (B, T, 2)
+    
+    # Calcola direzione tangente alla traiettoria GT
+    # diff[t] = target[t+1] - target[t]
+    tangent = torch.zeros_like(target_xy)
+    tangent[:, :-1] = target_xy[:, 1:] - target_xy[:, :-1]
+    tangent[:, -1] = tangent[:, -2]  # Ultimo punto usa la direzione precedente
+    
+    # Normalizza tangente
+    tangent_norm = torch.norm(tangent, dim=-1, keepdim=True).clamp(min=1e-8)
+    tangent = tangent / tangent_norm
+    
+    # Calcola normale (perpendicolare): ruota 90° -> (-dy, dx)
+    normal = torch.stack([-tangent[:, :, 1], tangent[:, :, 0]], dim=-1)  # (B, T, 2)
+    
+    # Vettore differenza pred - target
+    diff = pred_xy - target_xy  # (B, T, 2)
+    
+    # Deviazione laterale = proiezione su normale
+    lateral_dev = (diff * normal).sum(dim=-1)  # (B, T)
+    lateral_dev_abs = lateral_dev.abs()
+    
+    # Penalizza solo la parte OLTRE il confine della corsia
+    effective_boundary = lane_half_width - margin
+    excess = F.relu(lateral_dev_abs - effective_boundary)  # (B, T)
+    
+    # Loss quadratica sull'eccesso
+    loss = excess ** 2
+    
+    # Applica mask se presente
+    if mask is not None:
+        valid = ~mask  # (B, T)
+        loss = loss * valid.float()
+        n_valid = valid.sum().clamp(min=1)
+        return loss.sum() / n_valid
+    
+    return loss.mean()
+
+
+def lane_keeping_loss_soft(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    lane_half_width: float = 0.004,
+    sigma: float = 0.002,  # Smoothness of boundary
+) -> torch.Tensor:
+    """
+    Soft Lane Keeping Loss con transizione graduale al confine.
+    
+    Usa una funzione smooth invece di ReLU per evitare gradienti discontinui.
+    """
+    B, T, _ = pred.shape
+    
+    pred_xy = pred[:, :, :2]
+    target_xy = target[:, :, :2]
+    
+    # Tangent e Normal
+    tangent = torch.zeros_like(target_xy)
+    tangent[:, :-1] = target_xy[:, 1:] - target_xy[:, :-1]
+    tangent[:, -1] = tangent[:, -2]
+    tangent_norm = torch.norm(tangent, dim=-1, keepdim=True).clamp(min=1e-8)
+    tangent = tangent / tangent_norm
+    normal = torch.stack([-tangent[:, :, 1], tangent[:, :, 0]], dim=-1)
+    
+    # Lateral deviation
+    diff = pred_xy - target_xy
+    lateral_dev = (diff * normal).sum(dim=-1).abs()
+    
+    # Soft penalty: quadratic inside, linear outside (Huber-like)
+    # Smooth transition at lane boundary
+    inside_penalty = (lateral_dev ** 2) / (2 * lane_half_width)
+    outside_excess = lateral_dev - lane_half_width
+    outside_penalty = lane_half_width / 2 + outside_excess
+    
+    # Smooth transition using sigmoid-weighted combination
+    is_outside = torch.sigmoid((lateral_dev - lane_half_width) / sigma)
+    loss = (1 - is_outside) * inside_penalty + is_outside * outside_penalty
+    
+    if mask is not None:
+        valid = ~mask
+        loss = loss * valid.float()
+        return loss.sum() / valid.sum().clamp(min=1)
+    
+    return loss.mean()
+
+
 def winner_takes_all_loss(
     modes: torch.Tensor,
     target: torch.Tensor,
@@ -150,9 +263,11 @@ def total_loss(
     w_smooth: float = 0.05,
     w_diverse: float = 0.1,
     w_collision: float = 0.5,
+    w_lane: float = 0.0,  # NEW: Lane keeping weight (0 = disabled)
+    lane_half_width: float = 0.004,  # ~1.5m in normalized space
     use_wta: bool = True,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """Compute total loss."""
+    """Compute total loss with optional lane keeping."""
     
     losses = {}
     
@@ -185,6 +300,12 @@ def total_loss(
         col_loss = collision_loss(pred, C, ctx_mask)
         total = total + w_collision * col_loss
         losses['collision'] = col_loss.item()
+    
+    # Lane Keeping (NEW)
+    if w_lane > 0:
+        lk_loss = lane_keeping_loss(pred, target, pad_mask, lane_half_width)
+        total = total + w_lane * lk_loss
+        losses['lane'] = lk_loss.item()
     
     losses['total'] = total.item()
     
